@@ -710,6 +710,7 @@ export type TConfig = {
   userProvideSecretAccessKey?: boolean;
   userProvideSessionToken?: boolean;
   userProvideBearerToken?: boolean;
+  userProvideRegion?: boolean;
   disableBuilder?: boolean;
   retrievalModels?: string[];
   capabilities?: string[];
