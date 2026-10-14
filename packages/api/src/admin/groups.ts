@@ -483,8 +483,9 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
         await recordFailure('not_found');
         return res.status(404).json({ error: 'Group not found' });
       }
+      res.status(200).json({ success: true, id });
       await record('success');
-      return res.status(200).json({ success: true, id });
+      return res;
     } catch (error) {
       logger.error('[adminGroups] deleteGroup error:', error);
       return res.status(500).json({ error: 'Failed to delete group' });
