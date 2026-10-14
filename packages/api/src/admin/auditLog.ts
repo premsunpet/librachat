@@ -20,8 +20,11 @@ import type {
   AuditOutcome,
   AuditSeverity,
 } from '@librechat/data-schemas';
+import type { AuditMetadata } from '@librechat/data-schemas';
 import type { Response } from 'express';
 import type { ServerRequest } from '~/types/http';
+import type { RecordAuditEntry } from './audit';
+import { createAdminAuditEmitter } from './audit';
 
 const FORMULA_PREFIX = /^[=+\-@\t\r]/;
 /** UTF-8 BOM, written first so Excel recognizes the encoding on import. Spelled
@@ -64,6 +67,9 @@ export interface AdminAuditLogDeps {
     tenantId: string | undefined,
     options?: { isCancelled?: () => boolean; maxRows?: number },
   ) => Promise<AuditChainVerification>;
+  /** Optional audit emission for reads and exports; fail-open unless `auditFailClosed`. */
+  recordAuditEntry?: RecordAuditEntry;
+  auditFailClosed?: boolean;
 }
 
 interface CallerContext {
@@ -270,6 +276,32 @@ function parseFilters(query: AuditLogQuery): ParseResult<ParsedFilters> {
   };
 }
 
+/**
+ * Describes a filter set for the audit trail without storing what was searched
+ * for: enum and date filters are recorded as given, free-text filters (which can
+ * carry names or email addresses) only by name.
+ */
+function describeFilters(filters: ParsedFilters): AuditMetadata {
+  const metadata: AuditMetadata = {};
+  const lists: Array<[string, string[] | undefined]> = [
+    ['category', filters.category],
+    ['action', filters.action],
+    ['outcome', filters.outcome],
+    ['severity', filters.severity],
+  ];
+  for (const [key, values] of lists) {
+    if (values?.length) metadata[key] = [...values].sort().join(',');
+  }
+  if (filters.actorType) metadata.actorType = filters.actorType;
+  if (filters.from) metadata.from = filters.from.toISOString();
+  if (filters.to) metadata.to = filters.to.toISOString();
+  const freeText = (
+    ['search', 'actorQuery', 'targetQuery', 'targetType', 'capability'] as const
+  ).filter((key) => filters[key] != null);
+  if (freeText.length > 0) metadata.freeTextFilters = freeText.join(',');
+  return metadata;
+}
+
 export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
   listAuditLog: (req: ServerRequest, res: Response) => Promise<Response>;
   getAuditLogEntry: (req: ServerRequest, res: Response) => Promise<Response>;
@@ -277,6 +309,17 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
   exportAuditLogCsv: (req: ServerRequest, res: Response) => Promise<Response | void>;
 } {
   const { listAuditLogPage, findAuditLogEntry, streamAuditLogEntries, verifyAuditChain } = deps;
+  const emitAudit = createAdminAuditEmitter({
+    recordAuditEntry: deps.recordAuditEntry,
+    failClosed: deps.auditFailClosed,
+    logPrefix: '[adminAuditLog]',
+  });
+
+  /** Follow-up entries describe an attempt that already happened, so they never fail the caller. */
+  const emitFollowUp = createAdminAuditEmitter({
+    recordAuditEntry: deps.recordAuditEntry,
+    logPrefix: '[adminAuditLog]',
+  });
 
   async function listAuditLogHandler(req: ServerRequest, res: Response) {
     try {
@@ -301,6 +344,11 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
         cursor: cursor.value,
       });
 
+      await emitAudit(req, {
+        action: 'audit.read',
+        target: { type: 'audit_log' },
+        metadata: describeFilters(filters.value),
+      });
       return res.status(200).json(page);
     } catch (err) {
       logger.error('[adminAuditLog] list error:', err);
@@ -320,6 +368,10 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
 
       const entry = await findAuditLogEntry(caller.tenantId, id);
       if (!entry) return res.status(404).json({ error: 'Not found' });
+      await emitAudit(req, {
+        action: 'audit.read',
+        target: { type: 'audit_log', id },
+      });
       return res.status(200).json({ entry });
     } catch (err) {
       logger.error('[adminAuditLog] get error:', err);
@@ -346,6 +398,11 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
         });
 
         if (clientAborted) return res;
+        await emitAudit(req, {
+          action: 'audit.read',
+          target: { type: 'audit_log' },
+          metadata: { operation: 'verify' },
+        });
         return res.status(200).json(result);
       } finally {
         res.removeListener('close', markAborted);
@@ -358,17 +415,14 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
   }
 
   async function exportAuditLogCsvHandler(req: ServerRequest, res: Response) {
+    let exportRecorded = false;
+    let exportFailed: ((code: string) => Promise<void>) | undefined;
     try {
       const caller = resolveCaller(req);
       if (!caller) return res.status(401).json({ error: 'Authentication required' });
 
       const filters = parseFilters(req.query as AuditLogQuery);
       if (!filters.ok) return res.status(400).json({ error: filters.error });
-
-      const filenameStamp = new Date().toISOString().slice(0, 10);
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', `attachment; filename="audit-log-${filenameStamp}.csv"`);
-      res.setHeader('Cache-Control', 'no-store');
 
       /**
        * The socket-`close` listener is the canonical signal — it fires on client
@@ -383,6 +437,27 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
       res.once('close', markAborted);
       req.once('aborted', markAborted);
       const isCancelled = () => clientAborted;
+
+      /** Recorded before any row is streamed, so an export is never unaudited. */
+      const exportEvent = {
+        action: 'audit.exported' as const,
+        severity: 'warning' as const,
+        target: { type: 'audit_log' },
+        metadata: { format: 'csv', ...describeFilters(filters.value) },
+      };
+      await emitAudit(req, exportEvent);
+      exportRecorded = true;
+      exportFailed = (code: string) =>
+        emitFollowUp(req, {
+          ...exportEvent,
+          outcome: 'failure',
+          metadata: { ...exportEvent.metadata, code },
+        });
+
+      const filenameStamp = new Date().toISOString().slice(0, 10);
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="audit-log-${filenameStamp}.csv"`);
+      res.setHeader('Cache-Control', 'no-store');
 
       /**
        * Wait for `drain` when the socket buffer is full so we never queue an
@@ -424,6 +499,9 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
 
       res.removeListener('close', markAborted);
       req.removeListener('aborted', markAborted);
+      if (clientAborted) {
+        await exportFailed('client_aborted');
+      }
       if (!clientAborted) {
         /**
          * `truncated` is true only when rows existed beyond the cap (an exact-cap
@@ -444,6 +522,9 @@ export function createAdminAuditLogHandlers(deps: AdminAuditLogDeps): {
       }
     } catch (err) {
       logger.error('[adminAuditLog] export error:', err);
+      if (exportRecorded) {
+        await exportFailed?.('export_failed');
+      }
       if (!res.headersSent) {
         return res.status(500).json({ error: 'Failed to export audit log' });
       }

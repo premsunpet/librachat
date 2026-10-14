@@ -14,6 +14,7 @@ import type { Types, ClientSession } from 'mongoose';
 import type { Response } from 'express';
 import type { LangfuseTenantDestination } from '~/langfuse/tenantDestinations';
 import type { ServerRequest } from '~/types/http';
+import type { RecordAuditEntry } from './audit';
 import {
   getLangfuseTenantDestinations,
   resolveLangfuseTenantDestination,
@@ -23,6 +24,7 @@ import { decryptConfigSecret, encryptConfigSecretFields } from './secrets';
 import { scopeHeadersToDestination } from '~/langfuse/destinations';
 import { isLangfuseConnectionAvailable } from '~/langfuse/policy';
 import { resolveLangfuseSession } from '~/langfuse/session';
+import { createAdminAuditEmitter } from './audit';
 import { mergeHeaders } from '~/utils/headers';
 
 const DEFAULT_PRIORITY = 10;
@@ -73,6 +75,9 @@ export interface AdminLangfuseDeps {
   getMessages: MessageMethods['getMessages'];
   invalidateConfigCaches?: (tenantId?: string) => Promise<void>;
   recordConnectionUpdate?: (event: LangfuseConnectionEvent) => void;
+  /** Optional audit emission for connection updates; fail-open unless `auditFailClosed`. */
+  recordAuditEntry?: RecordAuditEntry;
+  auditFailClosed?: boolean;
 }
 
 function getTenantId(req: ServerRequest): string | undefined {
@@ -294,7 +299,14 @@ export function createAdminLangfuseHandlers(deps: AdminLangfuseDeps): {
     invalidateConfigCaches,
     recordConnectionUpdate = (event) =>
       logger.info({ message: '[adminLangfuse] Connection updated', ...event }),
+    recordAuditEntry,
+    auditFailClosed,
   } = deps;
+  const emitAudit = createAdminAuditEmitter({
+    recordAuditEntry,
+    failClosed: auditFailClosed,
+    logPrefix: '[adminLangfuse]',
+  });
 
   function findBaseConfig(options?: { includeInactive?: boolean }): Promise<IConfig | null> {
     return options
@@ -465,10 +477,21 @@ export function createAdminLangfuseHandlers(deps: AdminLangfuseDeps): {
         changes,
         verification_result: connectionChanged ? 'success' : 'skipped',
       });
-
       invalidateConfigCaches?.(getTenantId(req))?.catch((err) =>
         logger.error('[adminLangfuse] Cache invalidation failed after update:', err),
       );
+
+      /** Recorded after the cache invalidation starts so audit latency never delays it. Records which parts changed, never the keys themselves. */
+      await emitAudit(req, {
+        action: 'langfuse.updated',
+        severity: 'warning',
+        target: { type: 'langfuse', id: 'connection' },
+        metadata: {
+          changes: [...changes].sort().join(','),
+          enabled: status.enabled,
+          ...(status.destination ? { destination: status.destination } : {}),
+        },
+      });
 
       return res.status(200).json(status);
     } catch (error) {
