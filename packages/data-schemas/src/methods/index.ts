@@ -42,6 +42,8 @@ import {
   MAX_TOOL_FAVORITES,
   type ToolFavoriteMethods,
 } from './favorite';
+/* PR Automation */
+import { createPRAutomationMethods, type PRAutomationMethods } from './prAutomation';
 /* Agent Categories */
 import { createAgentCategoryMethods, type AgentCategoryMethods } from './agentCategory';
 /* Agent API Keys */
@@ -262,6 +264,7 @@ export type AllMethods = ToolApprovalGrantStorage &
   FileMethods &
   MemoryMethods &
   ToolFavoriteMethods &
+  PRAutomationMethods &
   AgentCategoryMethods &
   AgentApiKeyMethods &
   MCPServerMethods &
@@ -501,6 +504,7 @@ export function createMethods(
     ...createFileMethods(mongoose),
     ...createMemoryMethods(mongoose),
     ...createToolFavoriteMethods(mongoose),
+    ...createPRAutomationMethods(mongoose),
     ...createAgentCategoryMethods(mongoose),
     ...createAgentApiKeyMethods(mongoose),
     ...createMCPServerMethods(mongoose),
@@ -572,6 +576,7 @@ export type {
   ProjectFileRecord,
   ProjectFilesOptions,
   ToolFavoriteMethods,
+  PRAutomationMethods,
   AgentCategoryMethods,
   AgentApiKeyMethods,
   MCPServerMethods,
