@@ -76,12 +76,7 @@ const permissionConfigs = {
  */
 const createPermissionUpdateHandler = (permissionKey) =>
   createRolePermissionsUpdateHandler(
-    {
-      getRoleByName,
-      updateRoleByName,
-      recordAuditEntry,
-      auditFailClosed: process.env.AUDIT_LOG_FAIL_CLOSED === 'true',
-    },
+    { getRoleByName, updateRoleByName, recordAuditEntry },
     permissionConfigs[permissionKey],
   );
 

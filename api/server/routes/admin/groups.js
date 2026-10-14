@@ -25,7 +25,6 @@ const handlers = createAdminGroupsHandlers({
   deleteConfig: db.deleteConfig,
   deleteAclEntries: db.deleteAclEntries,
   recordAuditEntry: db.recordAuditEntry,
-  auditFailClosed: process.env.AUDIT_LOG_FAIL_CLOSED === 'true',
 });
 
 router.use(requireJwtAuth, requireAdminAccess);
