@@ -13,12 +13,16 @@ import type { FilterQuery, ClientSession, DeleteResult } from 'mongoose';
 import type { Response } from 'express';
 import type { ValidationError } from '~/types/error';
 import type { ServerRequest } from '~/types/http';
+import type { RecordAuditEntry } from './audit';
+import { createAdminAuditEmitter } from './audit';
 import { parsePagination } from './pagination';
 
 type GroupListFilter = Pick<GroupFilterOptions, 'source' | 'search'>;
 
 const VALID_GROUP_SOURCES: ReadonlySet<string> = new Set(['local', 'entra']);
 const MAX_CREATE_MEMBER_IDS = 500;
+/** Member ids per audit entry, so group creation writes a few ordered entries. */
+const AUDIT_MEMBER_CHUNK = 100;
 const MAX_SEARCH_LENGTH = 200;
 const MAX_NAME_LENGTH = 500;
 const MAX_DESCRIPTION_LENGTH = 2000;
@@ -46,30 +50,31 @@ export interface AdminGroupsDeps {
     session?: ClientSession,
   ) => Promise<IGroup | null>;
   createGroup: (groupData: Partial<IGroup>, session?: ClientSession) => Promise<IGroup>;
-  updateGroupById: (
+  /** Sets the fields and reports, from the write itself, whether any value changed. */
+  updateGroupFieldsTracked: (
     groupId: string | Types.ObjectId,
     data: Partial<Pick<IGroup, 'name' | 'description' | 'email' | 'avatar'>>,
-    session?: ClientSession,
-  ) => Promise<IGroup | null>;
+  ) => Promise<{ group: IGroup; changed: boolean } | null>;
   deleteGroup: (
     groupId: string | Types.ObjectId,
     session?: ClientSession,
   ) => Promise<IGroup | null>;
+  /** `changed` is decided by the write itself: true only when the membership was altered. */
   addUserToGroup: (
     userId: string | Types.ObjectId,
     groupId: string | Types.ObjectId,
     session?: ClientSession,
-  ) => Promise<{ user: IUser; group: IGroup | null }>;
+  ) => Promise<{ user: IUser; group: IGroup | null; changed: boolean }>;
   removeUserFromGroup: (
     userId: string | Types.ObjectId,
     groupId: string | Types.ObjectId,
     session?: ClientSession,
-  ) => Promise<{ user: IUser; group: IGroup | null }>;
-  removeMemberById: (
+  ) => Promise<{ user: IUser; group: IGroup | null; changed: boolean }>;
+  removeMemberByIdTracked: (
     groupId: string | Types.ObjectId,
     memberId: string,
     session?: ClientSession,
-  ) => Promise<IGroup | null>;
+  ) => Promise<{ group: IGroup | null; changed: boolean }>;
   findUsers: (
     searchCriteria: FilterQuery<IUser>,
     fieldsToSelect?: string | string[] | null,
@@ -82,6 +87,15 @@ export interface AdminGroupsDeps {
     principalType: PrincipalType;
     principalId: string | Types.ObjectId;
   }) => Promise<DeleteResult>;
+  /** Optional audit emission for group mutations; fail-open unless `auditFailClosed`. */
+  recordAuditEntry?: RecordAuditEntry;
+  /** When true, a failed audit write surfaces as a 5xx after the mutation has
+   * been persisted. Defaults to fail-open. */
+  auditFailClosed?: boolean;
+}
+
+function groupTarget(group: Pick<IGroup, 'name'> & { _id?: unknown }, id?: string) {
+  return { type: 'group', id: id ?? String(group._id ?? ''), name: group.name };
 }
 
 export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
@@ -99,15 +113,23 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
     countGroups,
     findGroupById,
     createGroup,
-    updateGroupById,
+    updateGroupFieldsTracked,
     deleteGroup,
     addUserToGroup,
     removeUserFromGroup,
-    removeMemberById,
+    removeMemberByIdTracked,
     findUsers,
     deleteConfig,
     deleteAclEntries,
+    recordAuditEntry,
+    auditFailClosed,
   } = deps;
+
+  const emitAudit = createAdminAuditEmitter({
+    recordAuditEntry,
+    failClosed: auditFailClosed,
+    logPrefix: '[adminGroups]',
+  });
 
   async function listGroupsHandler(req: ServerRequest, res: Response) {
     try {
@@ -222,6 +244,23 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
         memberIds,
         ...(body.idOnTheSource ? { idOnTheSource: body.idOnTheSource } : {}),
       });
+      await emitAudit(req, {
+        action: 'group.created',
+        target: groupTarget(group),
+        metadata: { source: group.source ?? null, memberCount: memberIds.length },
+      });
+      /** The initial members gain group-scoped access, so each is recorded like a member add
+       * (bounded by MAX_CREATE_MEMBER_IDS; sequential to keep the audit chain ordered). */
+      const unique = [...new Set(memberIds)];
+      for (let i = 0; i < unique.length; i += AUDIT_MEMBER_CHUNK) {
+        const chunk = unique.slice(i, i + AUDIT_MEMBER_CHUNK);
+        await emitAudit(req, {
+          action: 'group.member_added',
+          severity: 'warning',
+          target: groupTarget(group),
+          metadata: { userIds: chunk.join(','), count: chunk.length },
+        });
+      }
       return res.status(201).json({ group });
     } catch (error) {
       if ((error as ValidationError).name === 'ValidationError') {
@@ -285,9 +324,19 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
         return res.status(400).json({ error: 'No valid fields to update' });
       }
 
-      const group = await updateGroupById(id, updateData);
-      if (!group) {
+      /** The write itself reports whether it changed a value, so overlapping identical
+       * requests record one entry. */
+      const result = await updateGroupFieldsTracked(id, updateData);
+      if (!result) {
         return res.status(404).json({ error: 'Group not found' });
+      }
+      const { group, changed } = result;
+      if (changed) {
+        await emitAudit(req, {
+          action: 'group.updated',
+          target: groupTarget(group, id),
+          metadata: { fields: Object.keys(updateData).sort().join(',') },
+        });
       }
       return res.status(200).json({ group });
     } catch (error) {
@@ -326,6 +375,11 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
           logger.error('[adminGroups] cascade cleanup step failed for group:', id, result.reason);
         }
       }
+      await emitAudit(req, {
+        action: 'group.deleted',
+        severity: 'warning',
+        target: groupTarget(deleted, id),
+      });
       return res.status(200).json({ success: true, id });
     } catch (error) {
       logger.error('[adminGroups] deleteGroup error:', error);
@@ -416,9 +470,17 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
           .json({ error: 'Only native user ObjectIds can be added via this endpoint' });
       }
 
-      const { group } = await addUserToGroup(userId, id);
+      const { group, changed } = await addUserToGroup(userId, id);
       if (!group) {
         return res.status(404).json({ error: 'Group not found' });
+      }
+      if (changed) {
+        await emitAudit(req, {
+          action: 'group.member_added',
+          severity: 'warning',
+          target: groupTarget(group, id),
+          metadata: { userId },
+        });
       }
       return res.status(200).json({ group });
     } catch (error) {
@@ -437,14 +499,17 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
    * (which resolves the user), falling back to a raw $pull if the user record
    * no longer exists. Returns null only when the group itself is not found.
    */
-  async function removeObjectIdMember(groupId: string, userId: string): Promise<IGroup | null> {
+  async function removeObjectIdMember(
+    groupId: string,
+    userId: string,
+  ): Promise<{ group: IGroup | null; changed: boolean }> {
     try {
-      const { group } = await removeUserFromGroup(userId, groupId);
-      return group;
+      const { group, changed } = await removeUserFromGroup(userId, groupId);
+      return { group, changed };
     } catch (err) {
       const msg = err instanceof Error ? err.message : '';
       if (msg === 'User not found' || msg.startsWith('User not found:')) {
-        return removeMemberById(groupId, userId);
+        return removeMemberByIdTracked(groupId, userId);
       }
       throw err;
     }
@@ -457,12 +522,20 @@ export function createAdminGroupsHandlers(deps: AdminGroupsDeps): {
         return res.status(400).json({ error: 'Invalid group ID format' });
       }
 
-      const group = isValidObjectIdString(userId)
+      const { group, changed } = isValidObjectIdString(userId)
         ? await removeObjectIdMember(id, userId)
-        : await removeMemberById(id, userId);
+        : await removeMemberByIdTracked(id, userId);
 
       if (!group) {
         return res.status(404).json({ error: 'Group not found' });
+      }
+      if (changed) {
+        await emitAudit(req, {
+          action: 'group.member_removed',
+          severity: 'warning',
+          target: groupTarget(group, id),
+          metadata: { userId },
+        });
       }
       return res.status(200).json({ success: true });
     } catch (error) {

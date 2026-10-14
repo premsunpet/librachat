@@ -206,17 +206,22 @@ export function createUserGroupMethods(
     userId: string | Types.ObjectId,
     groupId: string | Types.ObjectId,
     session?: ClientSession,
-  ) => Promise<{ user: IUser; group: IGroup | null }>;
+  ) => Promise<{ user: IUser; group: IGroup | null; changed: boolean }>;
   removeUserFromGroup: (
     userId: string | Types.ObjectId,
     groupId: string | Types.ObjectId,
     session?: ClientSession,
-  ) => Promise<{ user: IUser; group: IGroup | null }>;
+  ) => Promise<{ user: IUser; group: IGroup | null; changed: boolean }>;
   removeUserFromAllGroups: (userId: string | Types.ObjectId) => Promise<void>;
   findGroupByQuery: (
     filter: Record<string, unknown>,
     session?: ClientSession,
   ) => Promise<IGroup | null>;
+  /** Sets scalar fields and reports atomically whether any value actually changed. */
+  updateGroupFieldsTracked: (
+    groupId: string | Types.ObjectId,
+    data: Partial<Pick<IGroup, 'name' | 'description' | 'email' | 'avatar'>>,
+  ) => Promise<{ group: IGroup; changed: boolean } | null>;
   updateGroupById: (
     groupId: string | Types.ObjectId,
     data: Record<string, unknown>,
@@ -279,6 +284,11 @@ export function createUserGroupMethods(
     memberId: string,
     session?: ClientSession,
   ) => Promise<IGroup | null>;
+  removeMemberByIdTracked: (
+    groupId: string | Types.ObjectId,
+    memberId: string,
+    session?: ClientSession,
+  ) => Promise<{ group: IGroup | null; changed: boolean }>;
 } {
   const getPrincipalsCache = (): CacheStore | undefined =>
     deps.getCache?.(CacheKeys.USER_PRINCIPALS);
@@ -742,7 +752,7 @@ export function createUserGroupMethods(
     userId: string | Types.ObjectId,
     groupId: string | Types.ObjectId,
     session?: ClientSession,
-  ): Promise<{ user: IUser; group: IGroup | null }> {
+  ): Promise<{ user: IUser; group: IGroup | null; changed: boolean }> {
     const User = mongoose.models.User as Model<IUser>;
     const Group = mongoose.models.Group as Model<IGroup>;
 
@@ -757,14 +767,19 @@ export function createUserGroupMethods(
     }
 
     const userIdOnTheSource = user.idOnTheSource || userId.toString();
-    const updatedGroup = await Group.findByIdAndUpdate(
-      groupId,
+    /** The filter makes the update match only when the member is absent, so a match
+     * is exactly one real change even when identical requests overlap. */
+    const changedGroup = await Group.findOneAndUpdate(
+      { _id: groupId, memberIds: { $ne: userIdOnTheSource } },
       { $addToSet: { memberIds: userIdOnTheSource } },
       options,
     ).lean<IGroup>();
+    const updatedGroup =
+      changedGroup ??
+      (await Group.findById(groupId, null, session ? { session } : {}).lean<IGroup>());
     await runAfterTransaction(session, () => invalidateMemberGroupsCache([userIdOnTheSource]));
 
-    return { user: user as IUser, group: updatedGroup };
+    return { user: user as IUser, group: updatedGroup, changed: changedGroup != null };
   }
 
   /**
@@ -781,7 +796,7 @@ export function createUserGroupMethods(
     userId: string | Types.ObjectId,
     groupId: string | Types.ObjectId,
     session?: ClientSession,
-  ): Promise<{ user: IUser; group: IGroup | null }> {
+  ): Promise<{ user: IUser; group: IGroup | null; changed: boolean }> {
     const User = mongoose.models.User as Model<IUser>;
     const Group = mongoose.models.Group as Model<IGroup>;
 
@@ -796,14 +811,17 @@ export function createUserGroupMethods(
     }
 
     const userIdOnTheSource = user.idOnTheSource || userId.toString();
-    const updatedGroup = await Group.findByIdAndUpdate(
-      groupId,
+    const changedGroup = await Group.findOneAndUpdate(
+      { _id: groupId, memberIds: userIdOnTheSource },
       { $pullAll: { memberIds: [userIdOnTheSource] } },
       options,
     ).lean<IGroup>();
+    const updatedGroup =
+      changedGroup ??
+      (await Group.findById(groupId, null, session ? { session } : {}).lean<IGroup>());
     await runAfterTransaction(session, () => invalidateMemberGroupsCache([userIdOnTheSource]));
 
-    return { user: user as IUser, group: updatedGroup };
+    return { user: user as IUser, group: updatedGroup, changed: changedGroup != null };
   }
 
   /**
@@ -1246,6 +1264,29 @@ export function createUserGroupMethods(
    * @param groupId - The group's ObjectId
    * @param data - Fields to set via $set
    */
+  async function updateGroupFieldsTracked(
+    groupId: string | Types.ObjectId,
+    data: Partial<Pick<IGroup, 'name' | 'description' | 'email' | 'avatar'>>,
+  ): Promise<{ group: IGroup; changed: boolean } | null> {
+    const Group = mongoose.models.Group as Model<IGroup>;
+    const entries = Object.entries(data);
+    if (entries.length === 0) {
+      const current = await Group.findById(groupId).lean<IGroup>();
+      return current ? { group: current, changed: false } : null;
+    }
+    /** The filter matches only a group that differs, so a match is exactly one real change. */
+    const changed = await Group.findOneAndUpdate(
+      { _id: groupId, $or: entries.map(([key, value]) => ({ [key]: { $ne: value } })) },
+      { $set: data },
+      { new: true },
+    ).lean<IGroup>();
+    if (changed) {
+      return { group: changed, changed: true };
+    }
+    const current = await Group.findById(groupId).lean<IGroup>();
+    return current ? { group: current, changed: false } : null;
+  }
+
   async function updateGroupById(
     groupId: string | Types.ObjectId,
     data: Record<string, unknown>,
@@ -1381,20 +1422,31 @@ export function createUserGroupMethods(
    * @param memberId - The raw memberId string to remove (ObjectId or idOnTheSource)
    * @param session - Optional MongoDB session for transactions
    */
+  async function removeMemberByIdTracked(
+    groupId: string | Types.ObjectId,
+    memberId: string,
+    session?: ClientSession,
+  ): Promise<{ group: IGroup | null; changed: boolean }> {
+    const Group = mongoose.models.Group as Model<IGroup>;
+    const options = { new: true, ...(session ? { session } : {}) };
+    const changedGroup = await Group.findOneAndUpdate(
+      { _id: groupId, memberIds: memberId },
+      { $pull: { memberIds: memberId } },
+      options,
+    ).lean<IGroup>();
+    const group =
+      changedGroup ??
+      (await Group.findById(groupId, null, session ? { session } : {}).lean<IGroup>());
+    await runAfterTransaction(session, () => invalidateMemberGroupsCache([memberId]));
+    return { group, changed: changedGroup != null };
+  }
+
   async function removeMemberById(
     groupId: string | Types.ObjectId,
     memberId: string,
     session?: ClientSession,
   ): Promise<IGroup | null> {
-    const Group = mongoose.models.Group as Model<IGroup>;
-    const options = { new: true, ...(session ? { session } : {}) };
-    const group = await Group.findByIdAndUpdate(
-      groupId,
-      { $pull: { memberIds: memberId } },
-      options,
-    ).lean<IGroup>();
-    await runAfterTransaction(session, () => invalidateMemberGroupsCache([memberId]));
-    return group;
+    return (await removeMemberByIdTracked(groupId, memberId, session)).group;
   }
 
   return {
@@ -1410,6 +1462,7 @@ export function createUserGroupMethods(
     removeUserFromAllGroups,
     findGroupByQuery,
     updateGroupById,
+    updateGroupFieldsTracked,
     bulkUpdateGroups,
     getUserGroups,
     getUserPrincipals,
@@ -1421,6 +1474,7 @@ export function createUserGroupMethods(
     countGroups,
     deleteGroup,
     removeMemberById,
+    removeMemberByIdTracked,
   };
 }
 
