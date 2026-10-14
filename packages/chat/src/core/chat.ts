@@ -306,6 +306,7 @@ export class Chat {
   /** The pause whose resume request is in flight, so a second submit cannot send it again. */
   private resuming?: string;
   private disposed = false;
+  private revision = 0;
   private readonly decisions = new Map<string, Agents.ToolApprovalResolution>();
   /** Pauses already resumed, whose replay by a reattached stream is stale. */
   private readonly resumed = new Set<string>();
@@ -329,6 +330,19 @@ export class Chat {
 
   get messages(): TMessage[] {
     return this.init.state.messages;
+  }
+
+  /**
+   * Counts changes reported to subscribers. A write can keep the same list while a message in it
+   * changed, so a snapshot keyed by this sees every write.
+   */
+  get version(): number {
+    return this.revision;
+  }
+
+  /** Replaces the message list. AI SDK: the `messages` setter. */
+  setMessages(messages: TMessage[]): void {
+    this.write(messages);
   }
 
   /** The pause the running generation waits on for a tool decision or an answer, if any. */
@@ -942,6 +956,7 @@ export class Chat {
   }
 
   private notify(): void {
+    this.revision += 1;
     for (const listener of this.listeners) {
       listener();
     }
