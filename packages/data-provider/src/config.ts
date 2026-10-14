@@ -4331,6 +4331,7 @@ export type TProviderSchema =
 export enum KnownEndpoints {
   anyscale = 'anyscale',
   apipie = 'apipie',
+  cheaperinference = 'cheaperinference',
   cohere = 'cohere',
   fireworks = 'fireworks',
   deepseek = 'deepseek',
@@ -4385,6 +4386,7 @@ export const alternateName = {
   [KnownEndpoints.xai]: 'xAI',
   [KnownEndpoints.vercel]: 'Vercel',
   [KnownEndpoints.helicone]: 'Helicone',
+  [KnownEndpoints.cheaperinference]: 'Cheaper Inference',
 };
 
 /**
