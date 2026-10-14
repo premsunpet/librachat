@@ -58,6 +58,7 @@
     "test:ci": "jest --ci"
   },
   "peerDependencies": {
+    "@tanstack/react-query": "^4.28.0",
     "librechat-data-provider": "*"
   },
   "dependencies": {
@@ -67,6 +68,7 @@
     "@babel/preset-env": "^7.29.5",
     "@babel/preset-react": "^7.22.15",
     "@babel/preset-typescript": "^7.21.0",
+    "@tanstack/react-query": "^4.28.0",
     "@types/jest": "^29.5.2",
     "babel-plugin-replace-ts-export-assignment": "^0.0.2",
     "jest": "^30.2.0",
