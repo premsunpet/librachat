@@ -15,11 +15,24 @@ import {
   PermissionTypes,
   isAgentsEndpoint,
   isAssistantsEndpoint,
+  getAgentToolSwitches,
 } from 'librechat-data-provider';
 import type { TChatProject, TMessage, TConversation } from 'librechat-data-provider';
 import type { SetterOrUpdater } from 'recoil';
 import type { ExtendedFile, FileSetter, ConvoGenerator, TAskFunction } from '~/common';
 import type { QueuedMessageContext } from '~/hooks/Chat/useSteering';
+import {
+  useTextarea,
+  useAutoSave,
+  useLocalize,
+  useRequiresKey,
+  useHandleKeyUp,
+  useQueryParams,
+  useSubmitMessage,
+  useFocusChatEffect,
+  useCodeWorkspace,
+  useApplyAgentToolSwitches,
+} from '~/hooks';
 import {
   cn,
   getModelSpec,
@@ -32,17 +45,6 @@ import {
   isPastedTextFileMarked,
 } from '~/utils';
 import {
-  useTextarea,
-  useAutoSave,
-  useLocalize,
-  useRequiresKey,
-  useHandleKeyUp,
-  useQueryParams,
-  useSubmitMessage,
-  useFocusChatEffect,
-  useCodeWorkspace,
-} from '~/hooks';
-import {
   useChatContext,
   useChatFormContext,
   useAddedChatContext,
@@ -54,6 +56,7 @@ import {
   PendingToolApprovalButton,
   PendingToolApprovalPanel,
 } from '~/components/Chat/approval/Review';
+import { useGetAgentByIdQuery, useGetStartupConfig } from '~/data-provider';
 import useComposerRestore from '~/hooks/Input/useComposerRestore';
 import { useChatSettings } from '~/Providers/ChatSettingsContext';
 import usePastedTextEdit from '~/hooks/Files/usePastedTextEdit';
@@ -68,7 +71,6 @@ import DuringRunSendButton from './DuringRunSendButton';
 import ProjectLandingChip from '../ProjectLandingChip';
 import useHasAccess from '~/hooks/Roles/useHasAccess';
 import useDictation from '~/hooks/Input/useDictation';
-import { useGetStartupConfig } from '~/data-provider';
 import CodeWorkspaceMenu from './CodeWorkspaceMenu';
 import useSteering from '~/hooks/Chat/useSteering';
 import CodeApprovalMenu from './CodeApprovalMenu';
@@ -250,6 +252,18 @@ const ChatForm = memo(function ChatForm({
   const conversationId = useMemo(
     () => conversation?.conversationId ?? Constants.NEW_CONVO,
     [conversation?.conversationId],
+  );
+  /** A saved agent's chat offers the tools its creator made switchable, in the
+   *  same palette and bar the ephemeral tools use. */
+  const toolSwitchAgentId =
+    isAgentsEndpoint(endpoint) && modelSpec?.hideBadgeRow !== true
+      ? conversation?.agent_id
+      : undefined;
+  const { data: switchAgent } = useGetAgentByIdQuery(toolSwitchAgentId);
+  useApplyAgentToolSwitches({ agent: switchAgent, conversationId });
+  const agentToolSwitches = useMemo(
+    () => (toolSwitchAgentId && switchAgent ? getAgentToolSwitches(switchAgent) : undefined),
+    [toolSwitchAgentId, switchAgent],
   );
   const isNewConversation = conversationId === '' || conversationId === Constants.NEW_CONVO;
   /**
@@ -989,6 +1003,7 @@ const ChatForm = memo(function ChatForm({
                 specName={conversation?.spec}
                 isSubmitting={isSubmitting}
                 observeToolAuthorization={showTools}
+                agentToolSwitches={agentToolSwitches}
               >
                 <Bar
                   index={index}
@@ -1011,7 +1026,7 @@ const ChatForm = memo(function ChatForm({
                   setFilesLoading={setFilesLoading}
                   canAttach={attachTarget.canAttach}
                   anchorRef={composerBoxRef}
-                  showTools={showTools}
+                  showTools={showTools || agentToolSwitches != null}
                   isSubmitting={isSubmitting}
                   showSpeech={SpeechToText}
                   speechDisabled={speechDisabled}
